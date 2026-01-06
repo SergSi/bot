@@ -138,16 +138,36 @@ class SimpleChannelParser:
                         raw_title = msg.get('message', '')
                         cleaned_title = clean_post_text(raw_title, 100)
                         
+                        # Преобразуем дату
+                        date_str = msg.get('date')
+                        post_date = None
+                        if date_str:
+                            try:
+                                # Пример формата: "2024-01-01T12:00:00"
+                                # Убираем 'Z' в конце и добавляем часовой пояс
+                                if date_str.endswith('Z'):
+                                    date_str = date_str[:-1] + '+00:00'
+                                post_date = datetime.fromisoformat(date_str)
+                            except Exception as e:
+                                logger.warning(f"Не удалось распарсить дату '{date_str}': {e}")
+                                post_date = datetime.now()
+                        else:
+                            post_date = datetime.now()
+                        
                         processed.append({
                             'id': msg.get('id'),
                             'title': cleaned_title,
                             'link': f"https://t.me/{self.channel_username[1:]}/{msg.get('id')}",
-                            'views': msg.get('views', 0),
-                            'forwards': msg.get('forwards', 0),
-                            'replies': msg.get('replies', {}).get('replies', 0),
-                            'date': msg.get('date')
+                            'views': int(msg.get('views', 0)),
+                            'forwards': int(msg.get('forwards', 0)),
+                            'replies': int(msg.get('replies', {}).get('replies', 0)),
+                            'date': post_date,
+                            'raw_date': date_str
                         })
                 
+                logger.info(f"Парсинг успешен: получено {len(processed)} сообщений")
+                if processed:
+                    logger.info(f"Первое сообщение: {processed[0]}")
                 return processed
                 
         except urllib.error.URLError as e:
@@ -157,28 +177,47 @@ class SimpleChannelParser:
             logger.error(f"Ошибка JSON: {e}")
             return []
         except Exception as e:
-            logger.error(f"Ошибка: {e}")
+            logger.error(f"Ошибка парсинга: {e}")
             return []
     
-def get_top_posts(self, posts: List[Dict], limit: int = 5) -> List[Dict]:
-    if not posts:
-        return []
-    
-    # Рейтинг = 40% просмотры + 25% репосты + 20% комментарии + 15% свежесть
-    for post in posts:
-        views_score = post.get('views', 0) * 0.4
-        forwards_score = post.get('forwards', 0) * 0.25
-        replies_score = post.get('replies', 0) * 0.20
+    def get_top_posts(self, posts: List[Dict], limit: int = 5) -> List[Dict]:
+        """Получить топ постов по композитному рейтингу"""
+        if not posts:
+            return []
         
-        # Свежесть (чем новее - тем выше балл)
-        days_old = (datetime.now() - post.get('date', datetime.now())).days
-        freshness_score = max(0, 100 - days_old) * 0.15
+        logger.info(f"Сортировка {len(posts)} постов для определения топ-{limit}")
         
-        post['composite_score'] = views_score + forwards_score + replies_score + freshness_score
-    
-    # Сортируем по композитному скору
-    sorted_posts = sorted(posts, key=lambda x: x.get('composite_score', 0), reverse=True)
-    return sorted_posts[:limit]
+        for post in posts:
+            # Получаем дату
+            post_date = post.get('date', datetime.now())
+            
+            # Баллы за просмотры, репосты и комментарии
+            views_score = post.get('views', 0) * 0.4
+            forwards_score = post.get('forwards', 0) * 0.25
+            replies_score = post.get('replies', 0) * 0.20
+            
+            # Свежесть (чем новее - тем выше балл)
+            days_old = (datetime.now() - post_date).days
+            freshness_score = max(0, 100 - days_old) * 0.15
+            
+            post['composite_score'] = views_score + forwards_score + replies_score + freshness_score
+            
+            # Для отладки
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Пост '{post.get('title', '')[:30]}...': "
+                           f"views={post.get('views')}*0.4={views_score:.1f}, "
+                           f"forwards={post.get('forwards')}*0.25={forwards_score:.1f}, "
+                           f"replies={post.get('replies')}*0.20={replies_score:.1f}, "
+                           f"freshness={freshness_score:.1f}, "
+                           f"total={post['composite_score']:.1f}")
+        
+        # Сортируем по композитному скору
+        sorted_posts = sorted(posts, key=lambda x: x.get('composite_score', 0), reverse=True)
+        
+        logger.info(f"Топ-пост имеет score: {sorted_posts[0].get('composite_score', 0):.1f}" 
+                   if sorted_posts else "Нет постов для сортировки")
+        
+        return sorted_posts[:limit]
 
 # ---------- МЕНЕДЖЕР КЭША ----------
 
@@ -200,34 +239,58 @@ class CacheManager:
                 logger.warning("Не удалось получить сообщения")
                 return False
             
+            logger.info(f"Получено {len(messages)} сообщений для анализа")
+            
+            # Используем метод get_top_posts из парсера
             top_posts = self.parser.get_top_posts(messages, 10)
             
+            # Рассчитываем статистику
+            total_views = sum(p.get('views', 0) for p in messages)
+            avg_views = total_views / max(len(messages), 1)
+            
+            # Находим самый просматриваемый пост
+            most_viewed = {}
+            if messages:
+                most_viewed = max(messages, key=lambda x: x.get('views', 0))
+            
+            # Рассчитываем средние репосты
+            total_forwards = sum(p.get('forwards', 0) for p in messages)
+            avg_forwards = total_forwards / max(len(messages), 1)
+            
+            # Подготавливаем данные для кэша
             cache_data = {
                 'channel': CHANNEL_USERNAME,
                 'last_updated': datetime.now().isoformat(),
                 'total_posts': len(messages),
-                'top_posts': top_posts[:5],
+                'top_posts': top_posts[:5],  # Берем только топ-5
                 'stats': {
-                    'total_views': sum(p.get('views', 0) for p in messages),
-                    'avg_views': sum(p.get('views', 0) for p in messages) / max(len(messages), 1),
-                    'most_viewed': max(messages, key=lambda x: x.get('views', 0), default={})
+                    'total_views': total_views,
+                    'avg_views': round(avg_views, 1),
+                    'total_forwards': total_forwards,
+                    'avg_forwards': round(avg_forwards, 1),
+                    'most_viewed': most_viewed
                 }
             }
             
+            # Сохраняем в файл
             with open(self.cache_file, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f, ensure_ascii=False, indent=2)
+                json.dump(cache_data, f, ensure_ascii=False, indent=2, default=str)
             
-            logger.info(f"✅ Кэш обновлен: {len(top_posts[:5])} постов")
+            logger.info(f"✅ Кэш обновлен: {len(top_posts[:5])} постов, "
+                       f"всего просмотров: {total_views:,}")
             return True
             
         except Exception as e:
-            logger.error(f"❌ Ошибка: {e}")
+            logger.error(f"❌ Ошибка обновления кэша: {e}")
+            import traceback
+            traceback.print_exc()
             return False
     
     def get_cache(self) -> Optional[Dict]:
         """Получить данные из кэша"""
         try:
             if not os.path.exists(self.cache_file):
+                logger.info("Файл кэша не найден")
                 return None
             
             with open(self.cache_file, 'r', encoding='utf-8') as f:
@@ -236,18 +299,30 @@ class CacheManager:
             last_updated = datetime.fromisoformat(data['last_updated'])
             days_since_update = (datetime.now() - last_updated).days
             
+            logger.info(f"Кэш обновлялся {days_since_update} дней назад")
+            
             if days_since_update >= UPDATE_INTERVAL_WEEKS * 7:
+                logger.info("Кэш устарел")
                 return None
             
             return data
             
-        except:
+        except json.JSONDecodeError as e:
+            logger.error(f"Ошибка чтения кэша: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка получения кэша: {e}")
             return None
     
     def get_top_posts_from_cache(self) -> List[Dict]:
         """Получить топ-посты из кэша"""
         cache = self.get_cache()
-        return cache.get('top_posts', []) if cache else []
+        if cache:
+            posts = cache.get('top_posts', [])
+            logger.info(f"Из кэша получено {len(posts)} постов")
+            return posts
+        logger.info("Кэш пуст или устарел")
+        return []
     
     def get_cache_stats(self) -> Optional[Dict]:
         """Получить статистику из кэша"""
@@ -255,6 +330,8 @@ class CacheManager:
         if cache:
             stats = cache.get('stats', {})
             stats['total_posts'] = cache.get('total_posts', 0)
+            stats['last_updated'] = cache.get('last_updated', 'Неизвестно')
+            logger.info(f"Статистика из кэша: {len(stats)} пунктов")
             return stats
         return None
 
@@ -429,7 +506,21 @@ async def top_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Пробуем обновить кэш
         success = await cache_manager.update_cache()
-        top_posts = cache_manager.get_top_posts_from_cache() if success else []
+        if success:
+            top_posts = cache_manager.get_top_posts_from_cache()
+            cache_data = cache_manager.get_cache()
+        else:
+            await query.edit_message_text(
+                "❌ *Не удалось обновить посты*\n\n"
+                "Попробуйте позже или воспользуйтесь резервным списком.",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Попробовать снова", callback_data="refresh_top")],
+                    [InlineKeyboardButton("📖 Резервный список", callback_data="fallback_posts")],
+                    [InlineKeyboardButton("🔙 Назад в меню", callback_data="back_to_start")]
+                ])
+            )
+            return
     
     if top_posts:
         # Форматируем дату обновления
@@ -493,8 +584,14 @@ async def top_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True
         )
     else:
-        # Резервный вариант, если парсинг не работает
+        # Если нет постов даже после обновления
         await show_fallback_top_posts(query)
+
+async def fallback_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать резервный список постов"""
+    query = update.callback_query
+    await query.answer()
+    await show_fallback_top_posts(query)
 
 async def show_fallback_top_posts(query):
     """Резервный список постов"""
@@ -526,13 +623,30 @@ async def refresh_top_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("🔄 Обновляю список...", show_alert=False)
     
+    # Показываем сообщение об обновлении
+    await query.edit_message_text(
+        "🔄 *Обновление списка постов...*\n\n"
+        "Пожалуйста, подождите несколько секунд.",
+        parse_mode='Markdown'
+    )
+    
     success = await cache_manager.update_cache()
     
     if success:
-        await query.answer("✅ Список обновлен!", show_alert=False)
+        # Возвращаемся к обновленному списку
         await top_posts(update, context)
     else:
-        await query.answer("❌ Не удалось обновить", show_alert=True)
+        await query.edit_message_text(
+            "❌ *Не удалось обновить список*\n\n"
+            "Возможно, возникли проблемы с доступом к каналу. "
+            "Попробуйте позже или воспользуйтесь резервным списком.",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Попробовать снова", callback_data="refresh_top")],
+                [InlineKeyboardButton("📖 Резервный список", callback_data="fallback_posts")],
+                [InlineKeyboardButton("🔙 Назад в меню", callback_data="back_to_start")]
+            ])
+        )
 
 @with_retry(max_retries=2, delay=1.0)
 async def channel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -545,9 +659,9 @@ async def channel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if stats and cache_data:
         last_updated = "Неизвестно"
-        if 'last_updated' in cache_data:
+        if 'last_updated' in stats:
             try:
-                update_time = datetime.fromisoformat(cache_data['last_updated'])
+                update_time = datetime.fromisoformat(stats['last_updated'])
                 last_updated = update_time.strftime("%d.%m.%Y %H:%M")
             except:
                 pass
@@ -559,7 +673,8 @@ async def channel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "*Средние показатели:*\n"
         text += f"• 👁 Средние просмотры: {stats.get('avg_views', 0):.0f}\n"
         text += f"• 🔄 Средние репосты: {stats.get('avg_forwards', 0):.1f}\n"
-        text += f"• 📷 Постов с медиа: {stats.get('posts_with_media', 0)}\n\n"
+        text += f"• 📊 Всего просмотров: {stats.get('total_views', 0):,}\n"
+        text += f"• 📈 Всего репостов: {stats.get('total_forwards', 0):,}\n\n"
         
         # Самый популярный пост
         most_viewed = stats.get('most_viewed', {})
@@ -567,8 +682,13 @@ async def channel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += "*Самый популярный пост:*\n"
             text += f"• 👁 Просмотров: {most_viewed.get('views', 0):,}\n"
             text += f"• 🔄 Репостов: {most_viewed.get('forwards', 0)}\n"
+            if most_viewed.get('title'):
+                title = most_viewed.get('title', '')[:50]
+                if len(most_viewed.get('title', '')) > 50:
+                    title += "..."
+                text += f"• 📝 {title}\n"
             if most_viewed.get('link'):
-                text += f"• 🔗 [Ссылка]({most_viewed['link']})\n"
+                text += f"• 🔗 [Ссылка на пост]({most_viewed['link']})\n"
         
         text += f"\n*Следующее обновление:* через {UPDATE_INTERVAL_WEEKS} неделю(и)"
         
@@ -587,14 +707,24 @@ async def channel_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
     else:
+        # Пытаемся обновить кэш, если статистики нет
         await query.edit_message_text(
-            "📊 Статистика временно недоступна.\n\n"
-            "Попробуйте обновить данные.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Обновить", callback_data="refresh_top")],
-                [InlineKeyboardButton("🔙 Назад", callback_data="top_posts")]
-            ])
+            "🔄 *Статистика недоступна. Обновляю данные...*",
+            parse_mode='Markdown'
         )
+        
+        success = await cache_manager.update_cache()
+        if success:
+            await channel_stats(update, context)
+        else:
+            await query.edit_message_text(
+                "📊 Статистика временно недоступна.\n\n"
+                "Попробуйте обновить данные позже.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Попробовать снова", callback_data="channel_stats")],
+                    [InlineKeyboardButton("🔙 Назад к постам", callback_data="top_posts")]
+                ])
+            )
 
 async def copy_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Копирование email"""
@@ -666,7 +796,7 @@ async def scheduled_cache_update(context: ContextTypes.DEFAULT_TYPE):
     logger.info("⏰ Запуск планового обновления кэша...")
     await cache_manager.update_cache()
 
-async def background_update_task(context: ContextTypes.DEFAULT_TYPE):
+async def background_update_task(application: Application):
     """Фоновая задача для обновления кэша раз в неделю"""
     while True:
         try:
@@ -674,7 +804,7 @@ async def background_update_task(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(UPDATE_INTERVAL_WEEKS * 7 * 24 * 3600)
             
             # Обновляем кэш
-            await scheduled_cache_update(context)
+            await scheduled_cache_update(application)
             
         except Exception as e:
             logger.error(f"Ошибка в фоновом обновлении: {e}")
@@ -688,7 +818,12 @@ async def post_init(application: Application):
     
     # Первоначальное обновление кэша
     logger.info("🔍 Первоначальное обновление кэша канала...")
-    await cache_manager.update_cache()
+    success = await cache_manager.update_cache()
+    
+    if success:
+        logger.info("✅ Кэш успешно инициализирован")
+    else:
+        logger.warning("⚠️ Не удалось инициализировать кэш. Будет использован резервный список.")
     
     # Запуск фоновой задачи
     asyncio.create_task(background_update_task(application))
@@ -734,6 +869,7 @@ def main():
         app.add_handler(CallbackQueryHandler(top_posts, pattern="^top_posts$"))
         app.add_handler(CallbackQueryHandler(refresh_top_posts, pattern="^refresh_top$"))
         app.add_handler(CallbackQueryHandler(channel_stats, pattern="^channel_stats$"))
+        app.add_handler(CallbackQueryHandler(fallback_posts, pattern="^fallback_posts$"))
         app.add_handler(CallbackQueryHandler(copy_email, pattern="^copy_email$"))
         app.add_handler(CallbackQueryHandler(how_to_email, pattern="^how_to_email$"))
         
