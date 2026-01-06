@@ -72,10 +72,23 @@ def clean_post_text(text: str, max_length: int = 100) -> str:
     return text
 
 def escape_markdown(text: str) -> str:
-    """Экранировать специальные символы Markdown"""
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    """Экранировать специальные символы Markdown, но не мешать тексту"""
+    # Сначала убираем ЛИШНЕЕ экранирование точек
+    # 1. Точки после цифр в начале строки или после пробела
+    text = re.sub(r'(\d)\\\.', r'\1.', text)
+    
+    # 2. Многоточия (три точки подряд)
+    text = text.replace('\\.\\.\\.', '...')
+    
+    # 3. Точки в середине предложений
+    text = text.replace('\\.', '.')
+    
+    # Теперь экранируем только реально опасные символы
+    # Но НЕ точку!
+    escape_chars = r'_*[]()~`>#+-=|{}!'
     for char in escape_chars:
         text = text.replace(char, f'\\{char}')
+    
     return text
 
 # ---------- УПРОЩЕННЫЙ ПАРСИНГ (БЕЗ AIOHTTP) ----------
@@ -147,14 +160,25 @@ class SimpleChannelParser:
             logger.error(f"Ошибка: {e}")
             return []
     
-    def get_top_posts(self, posts: List[Dict], limit: int = 5) -> List[Dict]:
-        """Получить топ-N постов"""
-        if not posts:
-            return []
+def get_top_posts(self, posts: List[Dict], limit: int = 5) -> List[Dict]:
+    if not posts:
+        return []
+    
+    # Рейтинг = 40% просмотры + 25% репосты + 20% комментарии + 15% свежесть
+    for post in posts:
+        views_score = post.get('views', 0) * 0.4
+        forwards_score = post.get('forwards', 0) * 0.25
+        replies_score = post.get('replies', 0) * 0.20
         
-        # Сортируем по просмотрам
-        sorted_posts = sorted(posts, key=lambda x: x.get('views', 0), reverse=True)
-        return sorted_posts[:limit]
+        # Свежесть (чем новее - тем выше балл)
+        days_old = (datetime.now() - post.get('date', datetime.now())).days
+        freshness_score = max(0, 100 - days_old) * 0.15
+        
+        post['composite_score'] = views_score + forwards_score + replies_score + freshness_score
+    
+    # Сортируем по композитному скору
+    sorted_posts = sorted(posts, key=lambda x: x.get('composite_score', 0), reverse=True)
+    return sorted_posts[:limit]
 
 # ---------- МЕНЕДЖЕР КЭША ----------
 
@@ -306,7 +330,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     welcome_text = (
-        "Навигатор по материалам канала *Практика землепользования*.\n\n"
+        "Навигатор канала *Практика землепользования*.\n\n"
         "Выберите, что вас интересует:"
     )
     
